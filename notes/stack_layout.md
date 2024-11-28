@@ -18,11 +18,12 @@ function's stack frame.
 This pointer only used to track the active top of current stack, so its value can be greater then 
 and equal to `ci->func` but less then `ci->top`(it cannot exceed `ci->top`).
 
-The relationship of these pointer is `L->stack <= ci->func < L->top < ci->top < L->stack_last`. 
+The relationship of these pointer is `L->stack <= ci->func < L->top <= ci->top < L->stack_last`. 
 
 so, we have:
 
-- `L->top - ci->func` represents the number of elements that currently exists in stack within the function's frame.
-- `ci->top - L->top` represents the unused space of current function's frame.
+- `L->top - (ci->func + 1)` represents the number of elements that currently exists in stack within the function's frame.
 - `L->top - (ci->func + 1)` represents the index of top of stack. If the stack is empty, we have `L->top == ci->func + 1`.
+- `ci->top - L->top` represents the unused space of current function's frame.
+
 
