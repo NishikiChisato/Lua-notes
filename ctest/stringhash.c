@@ -88,6 +88,7 @@ INTERNAL_API void tablerehash(String **vect, size_t old, size_t new) {
 }
 
 INTERNAL_API int growstrtable(StringTable *st) {
+  assert(cast2s(st->size * 2) <= MAXSTRTAB);
   String **nvec = (String **)realloc(st->hash, st->size * 2);
   if (nvec) {
     st->hash = nvec;
@@ -156,6 +157,7 @@ INTERNAL_API String *internstring(StringTable *st, const char *str, byte slen,
 }
 
 EXTERNAL_API String *createstr(StringTable *st, const char *str, byte slen) {
+  assert(slen <= MAXSHRLEN);
   uint32_t seed = 0xAAAB;
   return internstring(st, str, slen, seed);
 }
