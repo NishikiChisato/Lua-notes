@@ -78,11 +78,11 @@ For this definition, there are several key point to be pay attention:
 - `array` and `node` field are consecutive, without another field gap into them. Since this design, we can iterate array part and node part of table by using the same index(in `luaH_next` function).
 
 - `lsizenode` is the ceil of log2 to size of node array, namely, `ceil(log2(node size))`.
-  - Furthermore, the capasity(space allocated by allocator) of hash part is always the power of 2, and the capasity of array part is also the power of 2.  
-  - The capasity of hash part can be calculated by `2^(lsizenode)`
+  - Furthermore, the capacity(space allocated by allocator) of hash part is always the power of 2, and the capacity of array part is also the power of 2.  
+  - The capacity of hash part can be calculated by `2^(lsizenode)`
 
 - `alimit` do not represent the actually size(or real size) of array part. We can consider it as a **hint**, with which we can quickly check whether a integer index exist in array part of not.
-  - The capasity of array part is **the smallest power of 2 but greater than `alimit`**, which is done by `luaH_realasize`.
+  - The capacity of array part is **the smallest power of 2 but greater than `alimit`**, which is done by `luaH_realasize`.
   - If we explicitly call `setrealasize` marco, `alimit` is going to represent real size of array part. **Note that it will happen only when we call `setlimittosize`**.
   - For other case, `alimit` may be set to other value to represent a 'false positive' boundary of array pary(a hint).
 
@@ -160,7 +160,7 @@ l_sinline Node *mainpositionfromnode (const Table *t, Node *nd) {
 ### Get free position
 
 Starting from `t->node`, this function iterates node by node to find the first node with empty key.
-Node that this function do not check whether the capasity is enough or not, so this additional check must be done before calling this function.
+Node that this function do not check whether the capacity is enough or not, so this additional check must be done before calling this function.
 
 ```c
 static Node *getfreepos (Table *t) {
@@ -177,7 +177,20 @@ static Node *getfreepos (Table *t) {
 
 ### Array part
 
-TODO:
+The following two function should be treated together. `arrayindex` merely check if integer key out of bound(index bigger than the largest array capacity) or not.
+If failed, return zero; otherwise, do a convertion from integer to `unsigned int`.
+
+The second function try to find integer index of given key. This function should explicitly specific array capacity. Let's dive in details.
+This function `findindex` is only called in `luaH_next`, we can condsider it as auxiliary function to `luaH_next`. 
+
+Due to the integer key of lua begin from `1` but `t->array` begin from `0`, so we should check `key - 1` instead of `key` whether out of bound.
+Due to the exsitence of this offset, if we pass the last integer key of array part to `findindex`, it actually do not retrive that key.
+
+For example, if table in lua layer is `t = {[1] = 1, [2] = 2, [3] = 3, ["key"] = "val"}` and we push `3` to stack for `luaH_next` as start key, it will not iterate key `3` but key `key`.
+Because `findindex` will return `3` in this scenario. Although it less than `asize`, but `t->array[3]` is empty(only `t->array[0:2]` have value), so it goes to iterate hash part.
+
+In hash part, we should inherit this attribute. If we merely return `i + asize`, it will iterate input key, which is not satify our expectation, we should return `(i + 1) + asize`.
+
 ```c
 /*
 ** returns the index for 'k' if 'k' is an appropriate key to live in
@@ -216,38 +229,64 @@ static unsigned int findindex (lua_State *L, Table *t, TValue *key,
 
 ### Rehash
 
-TODO:
+The following series function form the rehash and resize functionality of table. 
+If we read from top to bottom according from source code order, it's extremely hard to understand the implementation of rehash, therefore we rearrange its order for better understanding.
+
+Let's take a look at the upper layer function, which can help to understand what's sematic of each auxiliary function(lower layer).
+Thanks to annotations after each line, we can roughy know functionality of each function.
+
+Function `numusearray` used to count the number of keys in array part, and function `numusehash` used to count the number of **integer keys** in hash part.
+Variable `na` is the number of keys in array part, and array `nums` with only `MAXABITS + 1` sizes serves as a buffer to distrubute each integer key to intevals with a power of 2 size and count how many keys exit in each intevals.
+For example, if the key is dense, say `[1, 100]`, the content of `nums` should be:
+
+```
+nums[] = {0}
+index i represent intevals (2^(i - 1), 2^i]
+nums[0] += 1 // how many keys lie in [1, 2] 
+nums[1] += 2 // how many keys lie in (2, 4]
+nums[2] += 4 // how many keys lie in (4, 8]
+nums[3] += 8 // how many keys lie in (8, 16]
+...
+nums[31] += ...
+```
+
+According the implication of this array, function `countint` used to distrubuting(apply ceil of log2 to) a integer key to proper index of `nums`
+Note that the return value of `numusearray` and `numusehash` both represent the number of key(irrespective its type) in array and hash part, but under the hook, `numusehash` only accumulate integer key and store result in `nums` and `na`.
+Now, we have known meaning of each variables. `na` is the number of keys in all table and `nums` is the distribution of each integer key.
+We pass these two variables to `computesizes` to calculate the new size of **array part**, which should satify has the half integer keys should goes into new array part.
+Note that we pass by reference of `na` to `computesizes`, so it will assign it to the number of integer goes to array part.
+After that, having been getted the new size of array part, we pass it and the new size of hash part(total key minus all integer keys going to array part) to resize the whole table.
+
 ```c
 /*
-** Compute the optimal size for the array part of table 't'. 'nums' is a
-** "count array" where 'nums[i]' is the number of integers in the table
-** between 2^(i - 1) + 1 and 2^i. 'pna' enters with the total number of
-** integer keys in the table and leaves with the number of keys that
-** will go to the array part; return the optimal size.  (The condition
-** 'twotoi > 0' in the for loop stops the loop if 'twotoi' overflows.)
+** nums[i] = number of keys 'k' where 2^(i - 1) < k <= 2^i
 */
-static unsigned int computesizes (unsigned int nums[], unsigned int *pna) {
+static void rehash (lua_State *L, Table *t, const TValue *ek) {
+  unsigned int asize;  /* optimal size for array part */
+  unsigned int na;  /* number of keys in the array part */
+  unsigned int nums[MAXABITS + 1];
   int i;
-  unsigned int twotoi;  /* 2^i (candidate for optimal size) */
-  unsigned int a = 0;  /* number of elements smaller than 2^i */
-  unsigned int na = 0;  /* number of elements to go to array part */
-  unsigned int optimal = 0;  /* optimal size for array part */
-  /* loop while keys can fill more than half of total size */
-  for (i = 0, twotoi = 1;
-       twotoi > 0 && *pna > twotoi / 2;
-       i++, twotoi *= 2) {
-    a += nums[i];
-    if (a > twotoi/2) {  /* more than half elements present? */
-      optimal = twotoi;  /* optimal size (till now) */
-      na = a;  /* all elements up to 'optimal' will go to array part */
-    }
-  }
-  lua_assert((optimal == 0 || optimal / 2 < na) && na <= optimal);
-  *pna = na;
-  return optimal;
+  int totaluse;
+  for (i = 0; i <= MAXABITS; i++) nums[i] = 0;  /* reset counts */
+  setlimittosize(t);
+  na = numusearray(t, nums);  /* count keys in array part */
+  totaluse = na;  /* all those keys are integer keys */
+  totaluse += numusehash(t, nums, &na);  /* count keys in hash part */
+  /* count extra key */
+  if (ttisinteger(ek))
+    na += countint(ivalue(ek), nums);
+  totaluse++;
+  /* compute new size for array part */
+  asize = computesizes(nums, &na);
+  /* resize the table to new computed sizes */
+  luaH_resize(L, t, asize, totaluse - na);
 }
 
+```
 
+This function calculate the ceil of log2 of key and add value with corresponding index in `nums` array. 
+
+```c
 static int countint (lua_Integer key, unsigned int *nums) {
   unsigned int k = arrayindex(key);
   if (k != 0) {  /* is 'key' an appropriate array index? */
@@ -257,8 +296,13 @@ static int countint (lua_Integer key, unsigned int *nums) {
   else
     return 0;
 }
+```
 
+The following two function calculate the number of keys in array part and hash part, respectively.
+For `numusehash`, it just reversely iterate all hash node and call `countint` to accumulately count integer keys.  
+For `numusearray`, it manually divery each integer key to `nums` array.
 
+```c
 /*
 ** Count keys in array part of table 't': Fill 'nums[i]' with
 ** number of keys that will go into corresponding slice and return
@@ -306,8 +350,62 @@ static int numusehash (const Table *t, unsigned int *nums, unsigned int *pna) {
   *pna += ause;
   return totaluse;
 }
+```
 
+Now, we have known the meaning of two input argement. `nums` represent the distribution of integer keys and `pna` represent how many integer keys. 
+This function should return new size(called optimal size) of array part, and this return value should hold several attributes.
 
+- The optimal size should be the power of 2.
+- The half of optimal size should less than the number of total integer keys and the optimal size should greater than and equal to the number of total integer keys. 
+
+The internal of this function is pretty easy to understand. It just accumulate `nums` by index `i` and check current value `a` greater than two power of `i` or not. 
+If so, it assign `optimal` to the value `2^i` and `na` to current accumulate value `a`, meaning that how many integer key should go to new array part.
+
+```c
+/*
+** Compute the optimal size for the array part of table 't'. 'nums' is a
+** "count array" where 'nums[i]' is the number of integers in the table
+** between 2^(i - 1) + 1 and 2^i. 'pna' enters with the total number of
+** integer keys in the table and leaves with the number of keys that
+** will go to the array part; return the optimal size.  (The condition
+** 'twotoi > 0' in the for loop stops the loop if 'twotoi' overflows.)
+*/
+static unsigned int computesizes (unsigned int nums[], unsigned int *pna) {
+  int i;
+  unsigned int twotoi;  /* 2^i (candidate for optimal size) */
+  unsigned int a = 0;  /* number of elements smaller than 2^i */
+  unsigned int na = 0;  /* number of elements to go to array part */
+  unsigned int optimal = 0;  /* optimal size for array part */
+  /* loop while keys can fill more than half of total size */
+  for (i = 0, twotoi = 1;
+       twotoi > 0 && *pna > twotoi / 2;
+       i++, twotoi *= 2) {
+    a += nums[i];
+    if (a > twotoi/2) {  /* more than half elements present? */
+      optimal = twotoi;  /* optimal size (till now) */
+      na = a;  /* all elements up to 'optimal' will go to array part */
+    }
+  }
+  lua_assert((optimal == 0 || optimal / 2 < na) && na <= optimal);
+  *pna = na;
+  return optimal;
+}
+
+```
+
+The following four functions are pretty easy to understand, we just take a glance with them.
+
+Function `setnodevector` juse reset hash part of table according to input `size`. If `size` is zero, it do not actually allocate space, it just assign `t->node` to global static dummy node.
+It means that, if many table both empty, the `t->node` field of these table both have the identical value. If we coincidentally load `ltable.c` many times(global static dummy node defines here), it may course some bugs.
+For each hash nodes, we simplely set its key and value to empty. For `t->lastfree`, it will be assigned to the next position of the last node(to find a free node, check `getfreepos` function).
+
+`reinsert` function just iterate all not-empty node from `ot` and insert it into `t` by calling `luaH_set`
+
+`exchangehashpart` function just exchange hash fields(which is `t->node, t->lsizenode, t->lastfree`), do not deep copy.
+
+`getfreepos` function will try to find the first empty starting from the last node of whole hash node array. If all nodes are not empty, it return `null` representing there aren't free space and need to rehash it.
+
+```c
 /*
 ** Creates an array for the hash part of a table with the given
 ** size, or reuses the dummy node if size is zero.
@@ -374,7 +472,21 @@ static void exchangehashpart (Table *t1, Table *t2) {
   t2->lastfree = lastfree;
 }
 
+static Node *getfreepos (Table *t) {
+  if (!isdummy(t)) {
+    while (t->lastfree > t->node) {
+      t->lastfree--;
+      if (keyisnil(t->lastfree))
+        return t->lastfree;
+    }
+  }
+  return NULL;  /* could not find a free place */
+}
+```
 
+The following function used to resize total hash table.
+
+```c
 /*
 ** Resize table 't' for the new given sizes. Both allocations (for
 ** the hash part and for the array part) can fail, which creates some
@@ -428,30 +540,6 @@ void luaH_resize (lua_State *L, Table *t, unsigned int newasize,
 void luaH_resizearray (lua_State *L, Table *t, unsigned int nasize) {
   int nsize = allocsizenode(t);
   luaH_resize(L, t, nasize, nsize);
-}
-
-/*
-** nums[i] = number of keys 'k' where 2^(i - 1) < k <= 2^i
-*/
-static void rehash (lua_State *L, Table *t, const TValue *ek) {
-  unsigned int asize;  /* optimal size for array part */
-  unsigned int na;  /* number of keys in the array part */
-  unsigned int nums[MAXABITS + 1];
-  int i;
-  int totaluse;
-  for (i = 0; i <= MAXABITS; i++) nums[i] = 0;  /* reset counts */
-  setlimittosize(t);
-  na = numusearray(t, nums);  /* count keys in array part */
-  totaluse = na;  /* all those keys are integer keys */
-  totaluse += numusehash(t, nums, &na);  /* count keys in hash part */
-  /* count extra key */
-  if (ttisinteger(ek))
-    na += countint(ivalue(ek), nums);
-  totaluse++;
-  /* compute new size for array part */
-  asize = computesizes(nums, &na);
-  /* resize the table to new computed sizes */
-  luaH_resize(L, t, asize, totaluse - na);
 }
 ```
 
@@ -595,7 +683,9 @@ static const TValue *getgeneric (Table *t, const TValue *key, int deadok) {
 
 ### Next function
 
-TODO:
+This function simplely iterate all elements from key's index getting by `findindex`. 
+We have explained the hook of `findindex`, it will return the next index of key's index, and the implementation of `luaH_next` is pretty intuitive. 
+
 ```c
 int luaH_next (lua_State *L, Table *t, StkId key) {
   unsigned int asize = luaH_realasize(t);
@@ -628,8 +718,8 @@ The key point of this function is check whether a integer key whthin the range o
 For simplest situation, if key in `[1, t->alimit]`, we directly retrive array part(note that `alimit` may not the real size of the array part, but in this scenario, we don't care it).
 If not, due to `alimit` may not the real size of array part, we do the following check:
 
-- Objectives: check `key - 1` whether whthin the capasity of array part.
-  - Firstly, we have known the capasity of array part is the smallest power of 2 but greater than `alimit`, which means that: `2^p < alimit <= 2^(p + 1)`.
+- Objectives: check `key - 1` whether whthin the capacity of array part.
+  - Firstly, we have known the capacity of array part is the smallest power of 2 but greater than `alimit`, which means that: `2^p < alimit <= 2^(p + 1)`.
   - Second, we know `key - 1` is greater than and equal to `alimit` now.
   - Therefore, we should check **whether `key - 1` is less than `2^(p + 1)` or not**.
 
