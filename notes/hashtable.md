@@ -17,7 +17,7 @@
       - [Get short string from hash table](#get-short-string-from-hash-table)
       - [Get long string from hash table](#get-long-string-from-hash-table)
   - [Set function](#set-function)
-  - [Search](#search)
+  - [Finding a boundary](#finding-a-boundary)
 <!--toc:end-->
 
 # Design of Table
@@ -271,7 +271,7 @@ nums[31] += ...
 ```
 
 According the implication of this array, function `countint` used to distrubuting(apply ceil of log2 to) a integer key to proper index of `nums`
-Note that the return value of `numusearray` and `numusehash` both represent the number of key(irrespective its type) in array and hash part, but under the hook, `numusehash` only accumulate integer key and store result in `nums` and `na`.
+Note that the return value of `numusearray` and `numusehash` both represent the number of key(irrespective its type) in array and hash part, but under the hood, `numusehash` only accumulate integer key and store result in `nums` and `na`.
 Now, we have known meaning of each variables. `na` is the number of keys in all table and `nums` is the distribution of each integer key.
 We pass these two variables to `computesizes` to calculate the new size of **array part**, which should satify has the half integer keys should goes into new array part.
 Note that we pass by reference of `na` to `computesizes`, so it will assign it to the number of integer goes to array part.
@@ -717,7 +717,7 @@ static const TValue *getgeneric (Table *t, const TValue *key, int deadok) {
 ### Next function
 
 This function simplely iterate all elements from key's index getting by `findindex`. 
-We have explained the hook of `findindex`, it will return the next index of key's index, and the implementation of `luaH_next` is pretty intuitive. 
+We have explained the hood of `findindex`, it will return the next index of key's index, and the implementation of `luaH_next` is pretty intuitive. 
 
 ```c
 int luaH_next (lua_State *L, Table *t, StkId key) {
@@ -908,66 +908,38 @@ void luaH_setint (lua_State *L, Table *t, lua_Integer key, TValue *value) {
 }
 ```
 
-## Search 
+## Finding a boundary
 
-TODO: About finding absent key.
+We need to clarify a few basic facts:
 
-The key point of this form of binary search is that left endpoint always satifies condition but right endpoint always not satifies condition.
-So, we initialize left and right endpoint to **left close and right open**, and we eventually return left endpoint, since left endpoint always satifies condition.
-Similarly, if we want to return right endpoint, that is right endpoint always satifies condition, we should initialize left and right endpoint to **left open and right close**. 
+- What's real size for array part.
+  - We have known that the capacity of array part of table is always the smallest power of 2 but greater than `t->alimit`.
+  - It means that `t->alimit` is always less than and equal to the capacity.
+  - Therefore, if `t->alimit` is equal to capacity of array part, we say current `t->alimit` is **real size** of array part, that is `isrealasize` will return true.
+  - Besides, there is a marco `limitequalsasize` to check whether `alimit` is real size. The condition is much simple, just check the flag of table(`7`-th bit) is set to zero and `t->alimit` is the power of 2 or not.
+  - `luaH_realasize` will return the real size of array part, the way of calculation is to find the the smallest power of 2 but greater than `t->alimit`.
+- The implication of `ispow2realasize`:
+  - First, when the marco `isrealasize` returns true, it means that `t->alimit` is equal to the capacity of array, and vice versa.
+  - If `isrealasize` returns false, it means that the real size of array part is the power of 2. Because real size of array is capacity of array, and the latter is always the power of 2.
+  - If `isrealasize` returns true, it means that `t->alimit` equals to real size of array, that is the capacity of array, so we next check whether `t->alimit` is the power of 2.
+  - Here, we should notice such a fact that `isrealasize` is always sync update with whether `t->alimit` is equal to real size of array part.
+  - This marco used to check whether the real size of array is the power of 2(I think this is nonsense, bucause the capacity of array part is always allocated to the power of 2).
 
-The function `binsearch` just the last section of `hash_search`, so we omit it.
+The following function is used to find a boundary of table, that is `t[i]` is present but `t[i + 1]` is absent(here, `i` is boundary). 
+Also pay attention to that, **its return index is lua form(base 1), but its internal process index is c form(base 0)**.
+According to the annotation before function, this function is pretty easy to understand, but we need to clarify the functionality of `binsearch` and `hash_search` functions.
 
-```c
-/*
-** Try to find a boundary in the hash part of table 't'. From the
-** caller, we know that 'j' is zero or present and that 'j + 1' is
-** present. We want to find a larger key that is absent from the
-** table, so that we can do a binary search between the two keys to
-** find a boundary. We keep doubling 'j' until we get an absent index.
-** If the doubling would overflow, we try LUA_MAXINTEGER. If it is
-** absent, we are ready for the binary search. ('j', being max integer,
-** is larger or equal to 'i', but it cannot be equal because it is
-** absent while 'i' is present; so 'j > i'.) Otherwise, 'j' is a
-** boundary. ('j + 1' cannot be a present integer key because it is
-** not a valid integer in Lua.)
-*/
-static lua_Unsigned hash_search (Table *t, lua_Unsigned j) {
-  lua_Unsigned i;
-  if (j == 0) j++;  /* the caller ensures 'j + 1' is present */
-  do {
-    i = j;  /* 'i' is a present index */
-    if (j <= l_castS2U(LUA_MAXINTEGER) / 2)
-      j *= 2;
-    else {
-      j = LUA_MAXINTEGER;
-      if (isempty(luaH_getint(t, j)))  /* t[j] not present? */
-        break;  /* 'j' now is an absent index */
-      else  /* weird case */
-        return j;  /* well, max integer is a boundary... */
-    }
-  } while (!isempty(luaH_getint(t, j)));  /* repeat until an absent t[j] */
-  /* i < j  &&  t[i] present  &&  t[j] absent */
-  while (j - i > 1u) {  /* do a binary search between them */
-    lua_Unsigned m = (i + j) / 2;
-    if (isempty(luaH_getint(t, m))) j = m;
-    else i = m;
-  }
-  return i;
-}
+For `binsearch` function, it just try to find a boundary range from `i` to `j`. Besides, there are two attributes it hodes:
+  - For element pointed by `i`, it's present; for element pointed by `j`, it's absent. 
+  - So, under the hood, when we encouter a element that is present, we update left endpoint; and if we encouter a element that is absent, we update right endpoint.
 
-static unsigned int binsearch (const TValue *array, unsigned int i,
-                                                    unsigned int j) {
-  while (j - i > 1u) {  /* binary search */
-    unsigned int m = (i + j) / 2;
-    if (isempty(&array[m - 1])) j = m;
-    else i = m;
-  }
-  return i;
-}
-```
+For `hash_search` function, it try to search a boundary in hash part of table.
+  - The input argument `j` means that this element(which is `j`, it's a element in table) is present(also `j + 1` is present), we try to find a boundary start from this element in hash part.
+  - This function keep doubling `j` until getting an absent element, and than we do a bindary search in hash part between two elements.
 
-TODO:
+Note that `luaH_getn` used to get the boundary of table, this boundary is always the max boundary if multiple boundary exists.
+For example, if we have a table `t = {1, 2, 3} t[5] = 5, t[7] = 7`. According to the definition of boundary, the boundary can be `3, 5, 7`, because `t[i]` is present but `t[i + 1]` is absent. 
+Due to the existence of multiple boundaries, we always **return the largest(rightmost) boundary**.
 
 ```c
 /*
@@ -1048,5 +1020,60 @@ lua_Unsigned luaH_getn (Table *t) {
   else  /* 'limit + 1' is also present */
     return hash_search(t, limit);
 }
-
 ```
+
+The key point of this form of binary search is that left endpoint always satifies condition but right endpoint always not satifies condition.
+So, we initialize left and right endpoint to **left close and right open**, and we eventually return left endpoint, since left endpoint always satifies condition.
+Similarly, if we want to return right endpoint, that is right endpoint always satifies condition, we should initialize left and right endpoint to **left open and right close**. 
+
+The function `binsearch` just the last section of `hash_search`, so we omit it.
+
+```c
+/*
+** Try to find a boundary in the hash part of table 't'. From the
+** caller, we know that 'j' is zero or present and that 'j + 1' is
+** present. We want to find a larger key that is absent from the
+** table, so that we can do a binary search between the two keys to
+** find a boundary. We keep doubling 'j' until we get an absent index.
+** If the doubling would overflow, we try LUA_MAXINTEGER. If it is
+** absent, we are ready for the binary search. ('j', being max integer,
+** is larger or equal to 'i', but it cannot be equal because it is
+** absent while 'i' is present; so 'j > i'.) Otherwise, 'j' is a
+** boundary. ('j + 1' cannot be a present integer key because it is
+** not a valid integer in Lua.)
+*/
+static lua_Unsigned hash_search (Table *t, lua_Unsigned j) {
+  lua_Unsigned i;
+  if (j == 0) j++;  /* the caller ensures 'j + 1' is present */
+  do {
+    i = j;  /* 'i' is a present index */
+    if (j <= l_castS2U(LUA_MAXINTEGER) / 2)
+      j *= 2;
+    else {
+      j = LUA_MAXINTEGER;
+      if (isempty(luaH_getint(t, j)))  /* t[j] not present? */
+        break;  /* 'j' now is an absent index */
+      else  /* weird case */
+        return j;  /* well, max integer is a boundary... */
+    }
+  } while (!isempty(luaH_getint(t, j)));  /* repeat until an absent t[j] */
+  /* i < j  &&  t[i] present  &&  t[j] absent */
+  while (j - i > 1u) {  /* do a binary search between them */
+    lua_Unsigned m = (i + j) / 2;
+    if (isempty(luaH_getint(t, m))) j = m;
+    else i = m;
+  }
+  return i;
+}
+
+static unsigned int binsearch (const TValue *array, unsigned int i,
+                                                    unsigned int j) {
+  while (j - i > 1u) {  /* binary search */
+    unsigned int m = (i + j) / 2;
+    if (isempty(&array[m - 1])) j = m;
+    else i = m;
+  }
+  return i;
+}
+```
+
