@@ -1,4 +1,3 @@
-<!--toc:start-->
 - [Design of Table](#design-of-table)
 - [Operation for Table](#operation-for-table)
   - [Auxiliary function](#auxiliary-function)
@@ -8,7 +7,7 @@
     - [Rehash](#rehash)
   - [Insert operation](#insert-operation)
   - [Get operation](#get-operation)
-    - [Main get function & Generic get function](#main-get-function-generic-get-function)
+    - [Main get function \& Generic get function](#main-get-function--generic-get-function)
       - [Main get function](#main-get-function)
       - [Generic get function](#generic-get-function)
     - [Next function](#next-function)
@@ -18,7 +17,8 @@
       - [Get long string from hash table](#get-long-string-from-hash-table)
   - [Set function](#set-function)
   - [Finding a boundary](#finding-a-boundary)
-<!--toc:end-->
+    - [What's the real size for the array part](#whats-the-real-size-for-the-array-part)
+    - [The implication of `ispow2realasize`](#the-implication-of-ispow2realasize)
 
 # Design of Table
 
@@ -43,16 +43,16 @@ typedef union Node {
 
 - Memory occupation
 
-Note that `node` is a union, and it contains both key and value for key-value pairs. Besides, lua rearrange the order of each field in node,
-it can optimize the occupy of memory.
+It should be noted that Node is defined as a union which encompasses both the key and the corresponding value for key-value pairs. 
+Additionally, Lua reorders the fields inside Node with the aim of optimizing memory usage.
 
-For example, in 64-bits system, the size of `node` is `3 * 8 = 24`:
+Take a 64-bit system as an example. In this context, the size of Node calculates to be `3 * 8 = 24`.
 
 ```c
 typedef union Node {
   struct NodeKey {
     Value value_;   /* start at 0 offset, alignment is 8 */
-    ly_byte tt_;    /* start at 8 offset, alignment is 1 */
+    lu_byte tt_;    /* start at 8 offset, alignment is 1 */
     lu_byte key_tt; /* start at 9 offset, alignment is 1 */
     int next;       /* start at 12 offset(two bytes pedding before), alignment is 4 */
     Value key_val;  /* start at 16 offset, alignment is 8 */
@@ -61,13 +61,13 @@ typedef union Node {
 } Node;
 ```
 
-By contrast, if we write `node` like this:
+In contrast, if we define the `Node` structure as follows:
 
 ```c
 typedef union Node {
   struct NodeKey {
     Value value_;
-    ly_byte tt_;
+    lu_byte tt_;
     lu_byte key_tt;
     Value key_val;
     int next;
@@ -76,10 +76,16 @@ typedef union Node {
 } Node;
 ```
 
-It will occupy `4 * 8 = 32` bits in 64-bits system.
+In a 64-bits system, it would occupy `4 * 8 = 32` bits.
 
-TODO:
-- The design of `next` field:
+- The design of the `next` field
+
+All hash nodes are stored in an array (with the type being `Node` and constituting the hash part of the table). 
+However, different nodes that have the same hash value will be chained together, and this chaining is achieved through the `next` field.
+
+We don't need to be concerned about the overflow issues of the `int` type. 
+This is because the capacity of the hash part will not exceed the maximum value that an `int` can represent. 
+Hence, using `int` for addressing purposes is adequate for this context.
 
 ```c
 typedef struct Table {
@@ -95,32 +101,32 @@ typedef struct Table {
 } Table;
 ```
 
-For this definition, there are several key point to be pay attention:
+For this definition, there are several key points to be pay attention:
 
-- `array` and `node` field are consecutive, without another field gap into them. Since this design, we can iterate array part and node part of table by using the same index(in `luaH_next` function).
-
-- `lsizenode` is the ceil of log2 to size of node array, namely, `ceil(log2(node size))`.
-  - Furthermore, the capacity(space allocated by allocator) of hash part is always the power of 2, and the capacity of array part is also the power of 2.  
+- `array` and `node` field are consecutive, without another fields gap between them. Thanks to this design, we can iterate over both the array part and the hash part (represented by the node field) of the table using the same index, as is done in the `luaH_next` function. 
+- `lsizenode` represents the ceiling of the base-2 logarithm of the size of the node array, that is, `ceil(log2(node size))`.
+  - Moreover, the capacity (the space allocated by the allocator) of the hash part is invariably a power of 2, and the same applies to the array part.
   - The capacity of hash part can be calculated by `2^(lsizenode)`
-
-- `alimit` do not represent the actually size(or real size) of array part. We can consider it as a **hint**, with which we can quickly check whether a integer index exist in array part of not.
-  - The capacity of array part is **the smallest power of 2 but greater than `alimit`**, which is done by `luaH_realasize`.
-  - If we explicitly call `setrealasize` marco, `alimit` is going to represent real size of array part. **Note that it will happen only when we call `setlimittosize`**.
-  - For other case, `alimit` may be set to other value to represent a 'false positive' boundary of array pary(a hint).
+- `alimit` does not represent the actual size(or real size) of array part. We can regard it as a **hint**, which helps us quickly determine whether an integer index exists in the array part or not.
+  - The capacity of the array part is the smallest power of 2 that is greater than alimit, which is calculated by `luaH_realasize`.
+  - If we explicitly call the setrealasize macro, alimit will represent the real size of the array part. It should be noted that this occurs only when we call the setlimittosize function.
+  - In other cases, alimit may be set to other values to represent a "false positive" boundary of the array part (merely serving as a hint).
 
 # Operation for Table
 
-For basic operation of table, we're going to focus on its sematic, namely, implication of input and output, and inner implementation.
+For basic operations of tables, our focus will be on their semantics, specifically the implications of input and output as well as their internal implementation.
 
 ## Auxiliary function
 
 ### Finding main position of key
 
-Given a key, try to find its main position, namely, the place we directly apply hash function to calculate.
+Given a key, we try to find its main position, which refers to the location where we directly apply the hash function to calculate the corresponding index.
 
-If the key is integer, we directly hash its value; if the key is float, we use custom hash function for floating-point.
-For bool type, it always map to index of `0` or `1` in hash part of table.
-For string, we use its hash value for addressing(specially, for long string, we lazy calculate its hash value). For light userdata, light C function, and other type, we both hash its pointer address;  
+- If the key is an integer, we directly hash its value. 
+- If it is a floating-point number, we use a custom hash function for floating-point values. 
+- For boolean values, a key of this type will always be mapped to either an index of 0 or 1 within the hash part of the table. 
+- For strings, we utilize their hash values for addressing purposes. In particular, for long strings, we calculate their hash values in a lazy manner. 
+- For light userdata, light C functions, and other types, we hash their pointer addresses.
 
 ```c
 /*
@@ -165,10 +171,10 @@ static Node *mainpositionTV (const Table *t, const TValue *key) {
 }
 ```
 
-The contrast version of last function, given a hash node, try to find the main position of its key.
+The contrast version of the last function, given a hash node, tries to find the main position of its key.
 
-Note that, the reason we introduce these two function is if collision is occured(two different key map to identical hash slot), we must shift one of them to another position(in Lua, usually to high address space).
-so, we must write a function to get the main position of one key. 
+It should be noted that the reason we introduce these two functions is that in case a collision occurs (i.e., when two different keys are mapped to the same hash slot), we have to move one of them to another position (in Lua, typically to a higher address space).
+So, we must write a function to obtain the main position of a key.
 
 ```c
 l_sinline Node *mainpositionfromnode (const Table *t, Node *nd) {
@@ -180,8 +186,8 @@ l_sinline Node *mainpositionfromnode (const Table *t, Node *nd) {
 
 ### Get free position
 
-Starting from `t->node`, this function iterates node by node to find the first node with empty key.
-Node that this function do not check whether the capacity is enough or not, so this additional check must be done before calling this function.
+Starting from `t->node`, this function iterates through the nodes one by one to find the first node with an empty key. 
+It should be noted that this function does not check whether the capacity is sufficient or not. Hence, this additional check must be carried out prior to calling this function.
 
 ```c
 static Node *getfreepos (Table *t) {
@@ -198,19 +204,19 @@ static Node *getfreepos (Table *t) {
 
 ### Array part
 
-The following two function should be treated together. `arrayindex` merely check if integer key out of bound(index bigger than the largest array capacity) or not.
-If failed, return zero; otherwise, do a convertion from integer to `unsigned int`.
+The following two functions should be considered together. The `arrayindex` function merely checks whether an integer key is out of bounds (i.e., its index is greater than the largest array capacity). 
+If it is out of bounds, the function returns zero; otherwise, it converts the integer to an `unsigned int`.
 
-The second function try to find integer index of given key. This function should explicitly specific array capacity. Let's dive in details.
-This function `findindex` is only called in `luaH_next`, we can condsider it as auxiliary function to `luaH_next`. 
+The second function attempts to find the integer index of a given key. This function should explicitly specify the array capacity. Let's explore the details.
+The findindex function is only called within `luaH_next`, and we can regard it as an auxiliary function for `luaH_next`.
 
-Due to the integer key of lua begin from `1` but `t->array` begin from `0`, so we should check `key - 1` instead of `key` whether out of bound.
-Due to the exsitence of this offset, if we pass the last integer key of array part to `findindex`, it actually do not retrive that key.
+Since the integer keys in Lua start from 1, while the `t->array` indexing starts from `0`, we should check `key - 1` instead of key to determine whether it is out of bounds. 
+Due to this offset, if we pass the last integer key of the array part to findindex, it will not actually retrieve that key.
 
-For example, if table in lua layer is `t = {[1] = 1, [2] = 2, [3] = 3, ["key"] = "val"}` and we push `3` to stack for `luaH_next` as start key, it will not iterate key `3` but key `key`.
-Because `findindex` will return `3` in this scenario. Although it less than `asize`, but `t->array[3]` is empty(only `t->array[0:2]` have value), so it goes to iterate hash part.
+For example, if in the Lua layer the table is defined as `t = {[1] = 1, [2] = 2, [3] = 3, ["key"] = "val"}` and we push `3` onto the stack as the starting key for `luaH_next`, it will not iterate over key `3` but rather the key "key". 
+This is because `findindex` will return `3` in this scenario. Although `3` is less than `asize`, `t->array[3]` is empty (only `t->array[0:2]` have values), so it proceeds to iterate over the hash part.
 
-In hash part, we should inherit this attribute. If we merely return `i + asize`, it will iterate input key, which is not satify our expectation, we should return `(i + 1) + asize`.
+In the hash part, we should maintain this property. If we simply return `i + asize`, it will iterate over the input key, which does not meet our expectations. Instead, we should return `(i + 1) + asize`.
 
 ```c
 /*
@@ -249,33 +255,33 @@ static unsigned int findindex (lua_State *L, Table *t, TValue *key,
 
 ### Rehash
 
-The following series function form the rehash and resize functionality of table. 
-If we read from top to bottom according from source code order, it's extremely hard to understand the implementation of rehash, therefore we rearrange its order for better understanding.
+The following series of functions implement the rehash and resize functionality of tables. 
+If we read the source code from top to bottom in its original order, it's extremely difficult to understand the implementation of rehash. Therefore, we rearrange the order for better comprehension.
 
-Let's take a look at the upper layer function, which can help to understand what's sematic of each auxiliary function(lower layer).
-Thanks to annotations after each line, we can roughy know functionality of each function.
+Let's first take a look at the higher-level function, which can assist in understanding the semantics of each auxiliary function (at the lower level). 
+Thanks to the annotations after each line, we can roughly understand the functionality of each function.
 
-Function `numusearray` used to count the number of keys in array part, and function `numusehash` used to count the number of **integer keys** in hash part.
-Variable `na` is the number of keys in array part, and array `nums` with only `MAXABITS + 1` sizes serves as a buffer to distrubute each integer key to intevals with a power of 2 size and count how many keys exit in each intevals.
-For example, if the key is dense, say `[1, 100]`, the content of `nums` should be:
+The `numusearray` function is used to count the number of keys in the array part, while the `numusehash` function is used to count the number of integer keys in the hash part. 
+The variable `na` represents the number of keys in the array part, and the array `nums` with a size of `MAXABITS + 1` serves as a buffer to distribute each integer key into intervals with a size that is a power of 2 and count how many keys exist in each interval.
+For example, if the keys are dense, say in the range `[1, 100]`, the content of `nums` should be as follows:
 
 ```
 nums[] = {0}
-index i represent intevals (2^(i - 1), 2^i]
-nums[0] += 1 // how many keys lie in [1, 2] 
-nums[1] += 2 // how many keys lie in (2, 4]
-nums[2] += 4 // how many keys lie in (4, 8]
-nums[3] += 8 // how many keys lie in (8, 16]
+index i represents intervals (2^(i - 1), 2^i]
+nums[0] += 1 // How many keys lie in [1, 2]
+nums[1] += 2 // How many keys lie in (2, 4]
+nums[2] += 4 // How many keys lie in (4, 8]
+nums[3] += 8 // How many keys lie in (8, 16]
 ...
-nums[31] += ...
+nums[31] +=...
 ```
 
-According the implication of this array, function `countint` used to distrubuting(apply ceil of log2 to) a integer key to proper index of `nums`
-Note that the return value of `numusearray` and `numusehash` both represent the number of key(irrespective its type) in array and hash part, but under the hood, `numusehash` only accumulate integer key and store result in `nums` and `na`.
-Now, we have known meaning of each variables. `na` is the number of keys in all table and `nums` is the distribution of each integer key.
-We pass these two variables to `computesizes` to calculate the new size of **array part**, which should satify has the half integer keys should goes into new array part.
-Note that we pass by reference of `na` to `computesizes`, so it will assign it to the number of integer goes to array part.
-After that, having been getted the new size of array part, we pass it and the new size of hash part(total key minus all integer keys going to array part) to resize the whole table.
+Based on the implication of this array, the `countint` function is used to distribute (by applying the ceiling of `log2`) an integer key to the proper index of the `nums` array.
+It should be noted that the return values of both `numusearray` and `numusehash` represent the number of keys (regardless of their types) in the array and hash parts respectively. 
+However, internally, `numusehash` only accumulates integer keys and stores the result in `nums` and `na`.
+Now that we understand the meaning of each variable, where `na` is the number of keys in the entire table and `nums` is the distribution of each integer key, we pass these two variables to the `computesizes` function to calculate the new size of the **array part**. 
+This new size should ensure that half of the integer keys go into the new array part. Note that we pass `na` by reference to `computesizes`, so it will assign the number of integer keys that should go into the array part.
+After obtaining the new size of the array part, we pass it along with the new size of the hash part (total keys minus all integer keys going to the array part) to resize the whole table.
 
 ```c
 /*
@@ -301,10 +307,9 @@ static void rehash (lua_State *L, Table *t, const TValue *ek) {
   /* resize the table to new computed sizes */
   luaH_resize(L, t, asize, totaluse - na);
 }
-
 ```
 
-This function calculate the ceil of log2 of key and add value with corresponding index in `nums` array. 
+This function calculates the ceiling of `log2` of a key and adds the value to the corresponding index in the `nums` array.
 
 ```c
 static int countint (lua_Integer key, unsigned int *nums) {
@@ -318,9 +323,9 @@ static int countint (lua_Integer key, unsigned int *nums) {
 }
 ```
 
-The following two function calculate the number of keys in array part and hash part, respectively.
-For `numusehash`, it just reversely iterate all hash node and call `countint` to accumulately count integer keys.  
-For `numusearray`, it manually divery each integer key to `nums` array.
+The following two functions calculate the number of keys in the array part and hash part respectively. 
+For `numusehash`, it simply iterates through all the hash nodes in reverse order and calls `countint` to accumulatively count the integer keys. 
+For `numusearray`, it manually distributes each integer key into the `nums` array.
 
 ```c
 /*
@@ -371,14 +376,13 @@ static int numusehash (const Table *t, unsigned int *nums, unsigned int *pna) {
 }
 ```
 
-Now, we have known the meaning of two input argument. `nums` represent the distribution of integer keys and `pna` represent how many integer keys. 
-This function should return new size(called optimal size) of array part, and this return value should hold several attributes.
+Now that we understand the meaning of the two input arguments, where `nums` represents the distribution of integer keys and `pna` represents the number of integer keys, this function should return the new size (referred to as the optimal size) of the array part, and this return value should possess several attributes:
 
-- The optimal size should be the power of 2.
-- The half of optimal size should less than the number of total integer keys and the optimal size should greater than and equal to the number of total integer keys. 
+- The optimal size should be a power of 2.
+- Half of the optimal size should be less than the total number of integer keys, and the optimal size should be greater than or equal to the number of total integer keys.
 
-The internal of this function is pretty easy to understand. It just accumulate `nums` by index `i` and check current value `a` greater than two power of `i` or not. 
-If so, it assign `optimal` to the value `2^i` and `na` to current accumulate value `a`, meaning that how many integer key should go to new array part.
+The internal logic of this function is relatively straightforward. It accumulates the values in `nums` by index `i` and checks whether the current accumulated value `a` is greater than `2^i`. 
+If so, it assigns `optimal` to the value `2^i` and `na` to the current accumulated value `a`, indicating how many integer keys should go to the new array part.
 
 ```c
 /*
@@ -411,17 +415,18 @@ static unsigned int computesizes (unsigned int nums[], unsigned int *pna) {
 }
 ```
 
-The following four functions are pretty easy to understand, we just take a glance with them.
+The following four functions are relatively straightforward, and we'll briefly look at them.
 
-Function `setnodevector` just reset hash part of table according to input `size`(`size` is not in byte but in number of elements). If `size` is zero, it do not actually allocate space, it just assign `t->node` to global static dummy node.
-It means that, if many table both empty, the `t->node` field of these table both have the identical value. If we coincidentally load `ltable.c` many times(global static dummy node defines here), it may course some bugs.
-For each hash nodes, we simplely set its key and value to empty. For `t->lastfree`, it will be assigned to the next position of the last node(to find a free node, check `getfreepos` function).
+The `setnodevector` function resets the hash part of the table according to the input `size` (where `size` represents the number of elements rather than bytes). 
+If `size` is zero, it doesn't actually allocate space but instead assigns `t->node` to the global static dummy node. This means that if many tables are empty, the `t->node` field of these tables will have the same value. 
+If we happen to load `ltable.c` multiple times (where the global static dummy node is defined), it might cause some bugs. 
+For each hash node, we simply set its key and value to empty. For `t->lastfree`, it will be assigned to the next position of the last node (to find a free node, refer to the `getfreepos` function).
 
-`reinsert` function just iterate all not-empty node from `ot` and insert it into `t` by calling `luaH_set`
+The `reinsert` function simply iterates through all non-empty nodes from `ot` and inserts them into `t` by calling `luaH_set`.
 
-`exchangehashpart` function just exchange hash fields(which is `t->node, t->lsizenode, t->lastfree`), do not deep copy.
+The `exchangehashpart` function exchanges the hash fields (specifically, `t->node`, `t->lsizenode`, and `t->lastfree`), without performing a deep copy.
 
-`getfreepos` function will try to find the first empty starting from the last node of whole hash node array. If all nodes are not empty, it return `null` representing there aren't free space and need to rehash it.
+The `getfreepos` function attempts to find the first empty node starting from the last node of the entire hash node array. If all nodes are not empty, it returns `NULL`, indicating that there is no free space and rehashing is required.
 
 ```c
 /*
@@ -500,20 +505,19 @@ static Node *getfreepos (Table *t) {
 }
 ```
 
-The following function used to resize total hash table.
-According to the explanation of [rehash](#rehash), we have known the meaning of two input argument.
-`newasize` represent the new size of array part, `nhsize` represent the new size of hash part.
-Pay attention to the definition of size here, it's not in byte, but in the number of elements.
-At the same time, the value of `newasize` and `nhsize` may not the power of 2, but the capacity of these part must be.
+The following function is used to resize the entire hash table. 
+According to the explanation in the [Rehash](#rehash) section, we already understand the meaning of the two input arguments. `newasize` represents the new size of the array part, and `nhsize` represents the new size of the hash part. 
+Pay attention to the definition of size here; it refers to the number of elements rather than bytes. 
+At the same time, the values of `newasize` and `nhsize` might not initially be powers of 2, but the capacities of these parts must eventually be powers of 2.
 
-This function declares a table **on stack** and **only initializes its hash part(all elements to empty)**, intending to make it as temporary hash part of table.
-The process of resize is as follows:
-- First, check whether array part of table will shrink or not
-  -  If so, intert elements with out of bound to hash part of temporary table.
-    - Here, there may be a question why we pretend array has a new size(small size)?
-    - Because we should shrink `t->alimit` in case of original key existing in array part may reinsert into array part(we expect these key goes into hash part).
-  - Otherwise, we simplely reallocate array part. If reallocation failed, we release hash part of temporary table and raise an error with array have beed resize.
-- Second, we set key and value to empty in new allocated space, exchange hash part to larger one(exchange hash part of current table to temporary one) and insert keys with previously exists in array part into hash part.
+This function declares a table **on the stack** and only initializes its hash part (setting all elements to empty), intending to use it as a temporary hash part of the table. 
+The process of resizing is as follows:
+- First, check whether the array part of the table will shrink or not.
+    - If it will shrink, insert elements that are out of bounds into the hash part of the temporary table.
+        - Here, a question might arise as to why we pretend the array has a new (smaller) size. 
+        - This is because we should shrink `t->alimit` in case original keys existing in the array part might be reinserted into the array part (while we expect these keys to go into the hash part).
+    - Otherwise, we simply reallocate the array part. If the reallocation fails, we release the hash part of the temporary table and raise an error with the array already resized.
+- Second, we set the key and value to empty in the newly allocated space, exchange the hash part with the larger one (exchange the hash part of the current table with that of the temporary table), and insert keys that previously existed in the array part into the hash part.
 
 ```c
 /*
@@ -566,8 +570,8 @@ void luaH_resize (lua_State *L, Table *t, unsigned int newasize,
 }
 ```
 
-The following function just a wrapper of `luaH_resize`, the input argument `nasize` is new array size.
-We pass it and size of hash part to `luaH_resize` function, meaning that we only intends to resize the size of array part.
+The following function is just a wrapper around `luaH_resize`. The input argument `nasize` represents the new array size. 
+We pass it along with the size of the hash part to the `luaH_resize` function, meaning that our intention is only to resize the size of the array part.
 
 ```c
 void luaH_resizearray (lua_State *L, Table *t, unsigned int nasize) {
@@ -576,21 +580,27 @@ void luaH_resizearray (lua_State *L, Table *t, unsigned int nasize) {
 }
 ```
 
+In general, when dealing with these functions related to table rehashing and resizing, it's crucial to understand how each function plays a role in maintaining and modifying the internal structure of the table. The operations are designed with careful consideration of memory management and the efficient organization of key-value pairs within the table. For instance, the way `luaH_resize` handles different scenarios of array shrinking or expanding, along with the proper handling of hash part exchanges and element reinsertions, showcases the complexity and precision required in this aspect of the Lua table implementation.
+
+Moreover, functions like `setnodevector`, `reinsert`, and `exchangehashpart` work in concert to support the overall resizing process. `setnodevector` takes care of initializing or reusing the hash part based on the specified size, ensuring proper setup of nodes. `reinsert` is responsible for moving elements from one table's hash part to another, while `exchangehashpart` enables the seamless swapping of hash-related fields between different tables when needed.
+
+All these functions together form a comprehensive mechanism for handling the dynamic nature of Lua tables, allowing them to adapt to changes in the number of elements and maintain optimal performance in terms of memory usage and access speed.
+
 ## Insert operation
 
-As annotation shown, this function aims to insert a new key into table as following steps:
-- Check key's main position is free:
-  - If free, that's it.
-  - Otherwise, check colliding key is in its main position:
-    - If so, new key goes to empty position(don't move colliding key).
-    - Otherwise, move colliding key to empty position and insert new key to its main position.
+As indicated in the annotations, this function aims to insert a new key into the table following these steps:
+- Check whether the key's main position is free:
+    - If it's free, then the insertion is completed.
+    - Otherwise, check if the colliding key is in its main position:
+        - If so, the new key will be placed in an empty position (without moving the colliding key).
+        - Otherwise, move the colliding key to an empty position and insert the new key into its main position.
 
-Miscellaneous:
-- If new key is floating-point, try to convert it to integer, that is apply floor and check whether equal or not.
-- `mp` is main position of new key(if not empty, that's colliding key), `othern` is main position of colliding key(which is `mp`).
-- why we loop `othern + gnext(othern) != mp` will eventually find the previous key of `mp`
-  - Due to colliding key is inserted before new key, therefore its main position must come before new key. So, if we iterate from colliding key's main position, we can eventually reach current colliding position. 
-  - After we find previous key of colliding key, we add a new key after it(copy `mp` to `f`) and correct field `next` of `f` and `mp`(`gnext(f)` should goes to distence between `mp` and `f`, and `gnext(mp)` should set to zero due to it's the last node in this chain).
+Miscellaneous points:
+- If the new key is a floating-point number, an attempt will be made to convert it to an integer. This is done by applying the floor function and checking whether the result is equal to the original floating-point value.
+- `mp` represents the main position of the new key (if not empty, it's the colliding key), and `othern` represents the main position of the colliding key (which could be `mp`).
+- Regarding why looping with the condition `othern + gnext(othern)!= mp` will eventually find the previous key of `mp`:
+    - Since the colliding key was inserted before the new key, its main position must precede that of the new key. Therefore, if we iterate from the colliding key's main position, we can eventually reach the current colliding position.
+    - After finding the previous key of the colliding key, we insert the new key after it (by copying `mp` to `f`), and then correct the `next` fields of `f` and `mp` (`gnext(f)` should be set to the distance between `mp` and `f`, and `gnext(mp)` should be set to zero as it becomes the last node in this chain).
 
 ```c
 /*
@@ -662,7 +672,7 @@ static void luaH_newkey (lua_State *L, Table *t, const TValue *key,
 
 ### Main get function & Generic get function
 
-All get function will return the value of input key.
+All get functions are designed to return the value corresponding to the input key.
 
 #### Main get function
 
@@ -689,9 +699,9 @@ const TValue *luaH_get (Table *t, const TValue *key) {
 
 #### Generic get function
 
-This function simplely check whether the key from slot is identical to input key starting from main position of input key. 
+This function simply checks whether the key in a slot is identical to the input key, starting from the main position of the input key.
 
-Lua use `gnext` marco to chain each hash slot. If one slot has empty next field(which is zero), meaning that it's last slot in hash table.
+In Lua, the `gnext` macro is used to chain each hash slot. If a slot has an empty `next` field (with a value of zero), it means that it's the last slot in the hash table.
 
 ```c
 /*
@@ -716,8 +726,8 @@ static const TValue *getgeneric (Table *t, const TValue *key, int deadok) {
 
 ### Next function
 
-This function simplely iterate all elements from key's index getting by `findindex`. 
-We have explained the hood of `findindex`, it will return the next index of key's index, and the implementation of `luaH_next` is pretty intuitive. 
+This function simply iterates over all elements starting from the index of the key obtained by `findindex`. 
+We've already explained the inner workings of `findindex`, which returns the next index after the key's index. The implementation of `luaH_next` is quite intuitive as a result.
 
 ```c
 int luaH_next (lua_State *L, Table *t, StkId key) {
@@ -746,26 +756,25 @@ int luaH_next (lua_State *L, Table *t, StkId key) {
 
 #### Get integer from hash table
 
-The key point of this function is check whether a integer key whthin the range of array part or not.
+The key point of this function is to check whether an integer key lies within the range of the array part.
 
-For simplest situation, if key in `[1, t->alimit]`, we directly retrive array part(note that `alimit` may not the real size of the array part, but in this scenario, we don't care it).
-If not, due to `alimit` may not the real size of array part, we do the following check:
+In the simplest situation, if the key is in the range `[1, t->alimit]`, we can directly retrieve it from the array part (note that `alimit` may not represent the real size of the array part, but in this scenario, we don't need to concern ourselves with that).
 
-- Objectives: check `key - 1` whether whthin the capacity of array part.
-  - Firstly, we have known the capacity of array part is the smallest power of 2 but greater than `alimit`, which means that: `2^p < alimit <= 2^(p + 1)`.
-  - Second, we know `key - 1` is greater than and equal to `alimit` now.
-  - Therefore, we should check **whether `key - 1` is less than `2^(p + 1)` or not**.
+If not, since `alimit` may not be the real size of the array part, we perform the following check:
 
-We can clear `p`-th bit of `key - 1`, which we call `res`.
+- Objectives: Check whether `key - 1` is within the capacity of the array part.
+    - Firstly, we know that the capacity of the array part is the smallest power of 2 that is greater than `alimit`, which means `2^p < alimit <= 2^(p + 1)`.
+    - Secondly, we know that `key - 1` is now greater than or equal to `alimit`.
+    - Therefore, we should check whether `key - 1` is less than `2^(p + 1)` or not.
 
-If `key - 1` is greater than and equal to `2^(p + 1)`, `res` will have some bits higher than `p`, so, it must greater than and equal to `alimit`(`alimit <= 2(p + 1)`)
-If `key - 1` is less than `2^(p + 1)`, `res` absolutely less than `2^p`(since `p`-th bit is cleared), so, it must less than `alimit`(`alimit > 2^p`)
+We can clear the `p`-th bit of `key - 1`, which we'll call `res`.
 
-Clearing `p`-th of `key - 1` can be done by apply `(key - 1) & ~(alimit - 1)`. Since `2^p < alimit <= 2 ^ (p + 1)`, so `2^p <= alimit - 1 < 2 ^ (p + 1)`
-Flipping `alimit - 1` will set all bits higher than `p`-th to one but `p`-th bit to zero, and other bits can be ignored. Therefore, do a binary and operation between `key - 1` and `~(alimit - 1)` will clear `p`-th bits of `key - 1`.
+If `key - 1` is greater than or equal to `2^(p + 1)`, `res` will have some bits higher than `p`, so it must be greater than or equal to `alimit` (`alimit <= 2 ^ (p + 1)`).
+If `key - 1` is less than `2^(p + 1)`, `res` will definitely be less than `2^p` (since the `p`-th bit is cleared), so it must be less than `alimit` (`alimit > 2^p`).
 
-If this key not exists in array part, we directly pass its value to hash and probe in hash part.
-The probe process is similar with `getgeneric` function, find its main position and iterate it from low address to high address.
+Clearing the `p`-th bit of `key - 1` can be achieved by applying the operation `(key - 1) & ~(alimit - 1)`. Since `2^p < alimit <= 2 ^ (p + 1)`, we have `2^p <= alimit - 1 < 2 ^ (p + 1)`. Flipping `alimit - 1` will set all bits higher than the `p`-th bit to one and the `p`-th bit to zero, and other bits can be ignored. Therefore, performing a binary AND operation between `key - 1` and `~(alimit - 1)` will clear the `p`-th bit of `key - 1`.
+
+If this key does not exist in the array part, we directly pass its value to the hash and perform probing in the hash part. The probing process is similar to that of the `getgeneric` function, where we find its main position and iterate from the low address to the high address.
 
 ```c
 /*
@@ -815,11 +824,9 @@ const TValue *luaH_getint (Table *t, lua_Integer key) {
 }
 ```
 
-
-
 #### Get short string from hash table
 
-Due to string always exists in hash part, so its getter function is pretty intuitive: calculating main position of input key, iterating node by node.
+Since strings always exist in the hash part, its getter function is quite intuitive. It involves calculating the main position of the input key and then iterating through the nodes one by one.
 
 ```c
 /*
@@ -843,10 +850,10 @@ const TValue *luaH_getshortstr (Table *t, TString *key) {
 
 #### Get long string from hash table
 
-For long string, directly call generic get function.
+For long strings, we directly call the generic get function.
 
-Pay attention that the way to get short string is similar with one to get long string.
-No matter its length, we both levearge its hash value to address in hash part. The difference is, the hash value for short string is pre-calculate, and one for long string is lzay-calculate.
+It should be noted that the way to get short strings is similar to that of getting long strings. Regardless of the string's length, we both leverage its hash value to address it within the hash part. 
+The difference lies in the fact that the hash value for short strings is pre-calculated, while that for long strings is lazily calculated.
 
 ```c
 const TValue *luaH_getstr (Table *t, TString *key) {
@@ -862,9 +869,9 @@ const TValue *luaH_getstr (Table *t, TString *key) {
 
 ## Set function
 
-The `slot` field is a pointer to the value of `key`, so its value should be gained by previous getter function, and we can directly use `setobj` marco to set its value.
+The `slot` field is a pointer to the value corresponding to the `key`. Its value should be obtained through the previous getter function, and then we can directly use the `setobj` macro to set its value.
 
-If `isabstkey(slot)` is true, means that this key do not exist in table, we should [insert a new key](#insert-operation) into it.
+If `isabstkey(slot)` evaluates to `true`, it indicates that this key does not exist in the table. In such a case, we should [insert a new key](#insert-operation) into it.
 
 ```c
 /*
@@ -880,11 +887,10 @@ void luaH_finishset (lua_State *L, Table *t, const TValue *key,
   else
     setobj2t(L, cast(TValue *, slot), value);
 }
-
 ```
 
-The following two function just a wrapper of `luaH_finishset`. 
-The first is generic function to set any-type of key to table, and the second is specifical function to set integer key to table.
+The following two functions are wrappers around `luaH_finishset`. 
+The first one is a generic function used to set a key of any type into the table, and the second one is a specific function designed to set an integer key into the table.
 
 ```c
 /*
@@ -910,36 +916,34 @@ void luaH_setint (lua_State *L, Table *t, lua_Integer key, TValue *value) {
 
 ## Finding a boundary
 
-We need to clarify a few basic facts:
+We need to clarify several basic facts:
 
-- What's real size for array part.
-  - We have known that the capacity of array part of table is always the smallest power of 2 but greater than `t->alimit`.
-  - It means that `t->alimit` is always less than and equal to the capacity.
-  - Therefore, if `t->alimit` is equal to capacity of array part, we say current `t->alimit` is **real size** of array part, that is `isrealasize` will return true.
-  - Besides, there is a marco `limitequalsasize` to check whether `alimit` is real size. The condition is much simple, just check the flag of table(`7`-th bit) is set to zero and `t->alimit` is the power of 2 or not.
-  - `luaH_realasize` will return the real size of array part, the way of calculation is to find the the smallest power of 2 but greater than `t->alimit`.
-- The implication of `ispow2realasize`:
-  - First, when the marco `isrealasize` returns true, it means that `t->alimit` is equal to the capacity of array, and vice versa.
-  - If `isrealasize` returns false, it means that the real size of array part is the power of 2. Because real size of array is capacity of array, and the latter is always the power of 2.
-  - If `isrealasize` returns true, it means that `t->alimit` equals to real size of array, that is the capacity of array, so we next check whether `t->alimit` is the power of 2.
-  - Here, we should notice such a fact that `isrealasize` is always sync update with whether `t->alimit` is equal to real size of array part.
-  - This marco used to check whether the real size of array is the power of 2(I think this is nonsense, bucause the capacity of array part is always allocated to the power of 2).
+### What's the real size for the array part
+- We already know that the capacity of the array part of a table is always the smallest power of 2 that is greater than `t->alimit`. This implies that `t->alimit` is always less than or equal to the capacity.
+- Therefore, if `t->alimit` is equal to the capacity of the array part, we consider the current `t->alimit` to be the **real size** of the array part, meaning that `isrealasize` will return `true`.
+- Besides, there is a macro `limitequalsasize` used to check whether `alimit` represents the real size. The condition is relatively simple: it just checks whether the 7th bit of the table's flag is set to zero and whether `t->alimit` is a power of 2.
+- The `luaH_realasize` function is used to return the real size of the array part. Its calculation method involves finding the smallest power of 2 that is greater than `t->alimit`.
 
-The following function is used to find a boundary of table, that is `t[i]` is present but `t[i + 1]` is absent(here, `i` is boundary). 
-Also pay attention to that, **its return index is lua form(base 1), but its internal process index is c form(base 0)**.
-According to the annotation before function, this function is pretty easy to understand, but we need to clarify the functionality of `binsearch` and `hash_search` functions.
+### The implication of `ispow2realasize`
+- First, when the macro `isrealasize` returns `true`, it means that `t->alimit` is equal to the capacity of the array, and vice versa.
+- If `isrealasize` returns `false`, it indicates that the real size of the array part is a power of 2. This is because the real size of the array is equivalent to its capacity, and the latter is always a power of 2.
+- If `isrealasize` returns `true`, it means that `t->alimit` equals the real size of the array, which is also the capacity of the array. In this case, we then check whether `t->alimit` is a power of 2.
+- It's important to note that `isrealasize` is always updated synchronously with whether `t->alimit` is equal to the real size of the array part.
+- This macro is used to check whether the real size of the array is a power of 2 (although one might think it's somewhat redundant since the capacity of the array part is always allocated as a power of 2).
 
-For `binsearch` function, it just try to find a boundary range from `i` to `j`. Besides, there are two attributes it hodes:
-  - For element pointed by `i`, it's present; for element pointed by `j`, it's absent. 
-  - So, under the hood, when we encouter a element that is present, we update left endpoint; and if we encouter a element that is absent, we update right endpoint.
+The following function, `luaH_getn`, is used to find a boundary of the table. That is, it finds an index `i` such that `t[i]` is present but `t[i + 1]` is absent (here, `i` represents the boundary). Also, it should be noted that **its return index is in Lua form (base 1), while its internal processing index is in C form (base 0)**. According to the annotation before the function, it's relatively easy to understand, but we need to clarify the functionality of the `binsearch` and `hash_search` functions.
 
-For `hash_search` function, it try to search a boundary in hash part of table.
-  - The input argument `j` means that this element(which is `j`, it's a element in table) is present(also `j + 1` is present), we try to find a boundary start from this element in hash part.
-  - This function keep doubling `j` until getting an absent element, and than we do a bindary search in hash part between two elements.
+For the `binsearch` function, it attempts to find a boundary within the range from `i` to `j`. Additionally, it has two properties:
+- For the element pointed to by `i`, it's present; for the element pointed to by `j`, it's absent.
+- So, internally, when we encounter an element that is present, we update the left endpoint; and when we encounter an element that is absent, we update the right endpoint.
 
-Note that `luaH_getn` used to get the boundary of table, this boundary is always the max boundary if multiple boundary exists.
-For example, if we have a table `t = {1, 2, 3} t[5] = 5, t[7] = 7`. According to the definition of boundary, the boundary can be `3, 5, 7`, because `t[i]` is present but `t[i + 1]` is absent. 
-Due to the existence of multiple boundaries, we always **return the largest(rightmost) boundary**.
+For the `hash_search` function, it tries to search for a boundary in the hash part of the table.
+- The input argument `j` indicates that this element (which is `j`, an element in the table) is present (and `j + 1` is also present). We then try to find a boundary starting from this element within the hash part.
+- This function keeps doubling `j` until it encounters an absent element. After that, we perform a binary search within the hash part between the two elements.
+
+Note that `luaH_getn` is used to obtain the boundary of the table, and this boundary is always the maximum boundary if multiple boundaries exist. 
+For example, if we have a table `t = {1, 2, 3, [5] = 5, [7] = 7}`, according to the definition of a boundary, the possible boundaries could be `3`, `5`, and `7` because `t[i]` is present while `t[i + 1]` is absent. 
+Due to the existence of multiple boundaries, we always **return the largest (rightmost) boundary**.
 
 ```c
 /*
@@ -978,9 +982,9 @@ lua_Unsigned luaH_getn (Table *t) {
   unsigned int limit = t->alimit;
   if (limit > 0 && isempty(&t->array[limit - 1])) {  /* (1)? */
     /* there must be a boundary before 'limit' */
-    if (limit >= 2 && !isempty(&t->array[limit - 2])) {
+    if (limit >= 2 &&!isempty(&t->array[limit - 2])) {
       /* 'limit - 1' is a boundary; can it be a new limit? */
-      if (ispow2realasize(t) && !ispow2(limit - 1)) {
+      if (ispow2realasize(t) &&!ispow2(limit - 1)) {
         t->alimit = limit - 1;
         setnorealasize(t);  /* now 'alimit' is not the real size */
       }
@@ -1014,7 +1018,7 @@ lua_Unsigned luaH_getn (Table *t) {
   }
   /* (3) 'limit' is the last element and either is zero or present in table */
   lua_assert(limit == luaH_realasize(t) &&
-             (limit == 0 || !isempty(&t->array[limit - 1])));
+             (limit == 0 ||!isempty(&t->array[limit - 1])));
   if (isdummy(t) || isempty(luaH_getint(t, cast(lua_Integer, limit + 1))))
     return limit;  /* 'limit + 1' is absent */
   else  /* 'limit + 1' is also present */
@@ -1022,11 +1026,11 @@ lua_Unsigned luaH_getn (Table *t) {
 }
 ```
 
-The key point of this form of binary search is that left endpoint always satifies condition but right endpoint always not satifies condition.
-So, we initialize left and right endpoint to **left close and right open**, and we eventually return left endpoint, since left endpoint always satifies condition.
-Similarly, if we want to return right endpoint, that is right endpoint always satifies condition, we should initialize left and right endpoint to **left open and right close**. 
+The key point of this form of binary search is that the left endpoint always satisfies the condition while the right endpoint always does not. 
+Therefore, we initialize the left and right endpoints to be **left closed and right open**, and we eventually return the left endpoint since it always satisfies the condition. 
+Similarly, if we want to return the right endpoint (i.e., the right endpoint always satisfies the condition), we should initialize the left and right endpoints to be **left open and right closed**.
 
-The function `binsearch` just the last section of `hash_search`, so we omit it.
+The function `binsearch` is actually the last part of `hash_search`, so we'll omit it for now.
 
 ```c
 /*
