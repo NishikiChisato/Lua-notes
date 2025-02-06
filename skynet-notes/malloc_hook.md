@@ -1,10 +1,11 @@
 # [Skynet] Understanding malloc hook
 
 <!--toc:start-->
-- [Malloc_hook](#mallochook)
+- [[Skynet] Understanding malloc hook](#skynet-understanding-malloc-hook)
   - [Intro](#intro)
   - [Description](#description)
   - [Conclusion](#conclusion)
+  - [Example](#example)
 <!--toc:end-->
 
 ## Intro
@@ -101,3 +102,143 @@ The final conclusions are:
 - Without `jemalloc`, `malloc` in standard library is used.
 - With `jemalloc` enabled, we can track extra information for memory usage and invoke `jemalloc` internally.
   - Additionally, only when we let `jemalloc` enabled, `malloc` is re-defined, which can further confirming these conclusions.
+
+## Example
+
+Below is a simplified example illustrating this design with three files:
+
+```c
+// inc_malloc.h
+
+#ifndef __INC_MALLOC_H__
+#define __INC_MALLOC_H__
+
+#include <stddef.h>
+
+#define inc_malloc malloc
+#define inc_free free
+
+void* inc_malloc(size_t sz);
+void inc_free(void* ptr);
+
+#endif
+
+```
+
+```c
+// malloc_hook.c
+#include <stdio.h>
+#include <string.h>
+#include "inc_malloc.h"
+
+#ifndef NOUSE_JEMALLOC
+
+#include <jemalloc/jemalloc.h>
+
+#define MEM_MALLOCED 1
+#define MEM_FREE 2
+
+typedef struct {
+  size_t mem_size;
+  uint32_t tag;
+  size_t cookie_size;
+} mem_cookie;
+
+#define PREFIX_SIZE sizeof(mem_cookie)
+
+static void* fill_prefix(void* ptr, size_t sz, size_t cookie_size) {
+  mem_cookie* st = (mem_cookie*)ptr; 
+  st->mem_size = sz;
+  st->tag = MEM_MALLOCED;
+  char* ret = (char*)st + cookie_size;
+  memcpy(ret - sizeof(cookie_size), &cookie_size, sizeof(cookie_size));
+  return ret;
+}
+
+static size_t get_cookie_size(void* ptr) {
+  size_t sz;
+  memcpy(&sz, (char*)ptr - sizeof(sz), sizeof(sz));
+  return sz;
+}
+
+static void* clear_prefix(void* ptr) {
+  size_t cookie_size = get_cookie_size(ptr);
+  mem_cookie* st = (mem_cookie*)((char*)ptr - cookie_size);
+  st->tag = MEM_FREE;
+  return st;
+}
+
+void* inc_malloc(size_t sz) {
+  void* ptr = je_malloc(sz + PREFIX_SIZE);
+  return fill_prefix(ptr, sz, PREFIX_SIZE);
+}
+
+void inc_free(void* ptr) {
+  if(ptr == NULL) {
+    return;
+  }
+  void* rawptr = clear_prefix(ptr);
+  je_free(rawptr);
+  return;
+}
+
+void dumpmem(void* ptr) {
+  size_t cookie_size = get_cookie_size(ptr);
+  mem_cookie* st = (mem_cookie*)((char*)ptr - cookie_size);
+  fprintf(stdout, "[mem_cookie: %p]: mem_size: %zu bytes, tag: %s, cookie_size: %zu bytes\nptr: %p\n"
+          , st
+          , st->mem_size
+          , st->tag == MEM_MALLOCED ? ("MEM_MALLOCED") : st->tag == MEM_FREE ? "MEM_FREE" : "ERR"
+          , st->cookie_size, ptr);
+  fflush(stdout);
+}
+
+#else
+
+void dumpmem(void* ptr) {
+  fprintf(stdout, "not use jemalloc\n");
+  fflush(stdout);
+}
+
+#endif
+
+```
+
+```c
+// test.c
+#include "inc_malloc.h" // we must include this file
+
+void dumpmem(void* ptr);
+
+int main() {
+  const int cnt = 3;
+  int* ptr = (int*)inc_malloc(sizeof(int) * cnt);
+  dumpmem(ptr);
+  inc_free(ptr);
+  dumpmem(ptr);
+  return 0;
+}
+
+```
+
+If we not compile with jemalloc, the output is:
+
+```bash
+❯ clang -I. -ljemalloc test.c malloc_hooc.c -DNOUSE_JEMALLOC -o test
+❯ ./test
+not use jemalloc
+not use jemalloc
+```
+
+Instead, if we compile with it, the output is:
+
+```bash
+❯ clang -I. -ljemalloc test.c malloc_hooc.c -o test
+❯ ./test
+[mem_cookie: 0x73caee21d000]: mem_size: 12 bytes, tag: MEM_MALLOCED, cookie_size: 24 bytes
+ptr: 0x73caee21d018
+[mem_cookie: 0x73caee21d000]: mem_size: 12 bytes, tag: MEM_FREE, cookie_size: 24 bytes
+ptr: 0x73caee21d018
+```
+
+> Notes: In an earlier version of this example, I directly used `printf` inside `inc_malloc` and `inc_free` to print debugging information. This approach led to infinite loop because `printf` itself calls `malloc` internally.
