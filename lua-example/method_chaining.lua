@@ -24,7 +24,6 @@ function listset:dump()
 end
 
 function listset:foreach()
-  local row = #self
   local i, j = 1, 1
   return function()
     if i > #self then return nil end
@@ -39,10 +38,11 @@ end
 
 listset {1,2,3} {2,3,4} {3,4,5} {4,5,6} {5,6,7} : dump()
 
-for i, j, v in listset 
-  {"v1", "v2", "v3"} 
-  {"v4", "v5", "v6"} 
-  {"v7", "v8", "v9"} 
+for i, j, v in listset
+  {"v1", "v2", "v3"}
+  {"v4", "v5", "v6"}
+  {"v7", "v8", "v9"}
   : foreach() do
   print(i, j, v)
 end
+
